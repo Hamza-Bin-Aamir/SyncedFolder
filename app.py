@@ -113,6 +113,7 @@ class TransceiverService:
     def handle_client(self, client_socket, address):
         """Handle incoming client connections."""
         try:
+            # Receive the initial message
             data = client_socket.recv(4096).decode('utf-8')
             message = json.loads(data)
             
@@ -123,21 +124,40 @@ class TransceiverService:
                     'type': 'manifest_response',
                     'manifest': manifest
                 }
-                client_socket.send(json.dumps(response).encode('utf-8'))
+                response_data = json.dumps(response).encode('utf-8')
+                # Send length first, then data
+                client_socket.send(len(response_data).to_bytes(4, 'big'))
+                client_socket.send(response_data)
                 
             elif message['type'] == 'file_request':
-                # Send requested file
+                # Send requested file using binary protocol
                 file_path = self.sync_folder / message['file_path']
                 if file_path.exists() and file_path.is_file():
-                    with open(file_path, 'rb') as f:
-                        file_data = f.read()
-                    
-                    response = {
+                    # Send file info as JSON header
+                    file_info = {
                         'type': 'file_response',
                         'file_path': message['file_path'],
-                        'file_data': file_data.hex()
+                        'file_size': file_path.stat().st_size
                     }
-                    client_socket.send(json.dumps(response).encode('utf-8'))
+                    header_data = json.dumps(file_info).encode('utf-8')
+                    
+                    # Send header length, then header, then file data
+                    client_socket.send(len(header_data).to_bytes(4, 'big'))
+                    client_socket.send(header_data)
+                    
+                    # Send file data in chunks
+                    with open(file_path, 'rb') as f:
+                        while True:
+                            chunk = f.read(8192)
+                            if not chunk:
+                                break
+                            client_socket.send(chunk)
+                else:
+                    # File not found
+                    error_response = {'type': 'file_not_found', 'file_path': message['file_path']}
+                    response_data = json.dumps(error_response).encode('utf-8')
+                    client_socket.send(len(response_data).to_bytes(4, 'big'))
+                    client_socket.send(response_data)
                     
             elif message['type'] == 'push_manifest':
                 # Receive a manifest from a peer who is pushing
@@ -158,23 +178,36 @@ class TransceiverService:
                     'type': 'push_file_list',
                     'files_needed': files_to_request
                 }
-                client_socket.send(json.dumps(response).encode('utf-8'))
+                response_data = json.dumps(response).encode('utf-8')
+                client_socket.send(len(response_data).to_bytes(4, 'big'))
+                client_socket.send(response_data)
                 
             elif message['type'] == 'push_file':
-                # Receive a file being pushed to us
+                # Receive a file being pushed to us using binary protocol
                 file_path = message['file_path']
-                file_data = bytes.fromhex(message['file_data'])
+                file_size = message['file_size']
                 
                 local_file_path = self.sync_folder / file_path
                 local_file_path.parent.mkdir(parents=True, exist_ok=True)
                 
+                # Receive file data
                 with open(local_file_path, 'wb') as f:
-                    f.write(file_data)
+                    remaining = file_size
+                    while remaining > 0:
+                        chunk_size = min(8192, remaining)
+                        chunk = client_socket.recv(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
                 
                 print(f"Received pushed file: {file_path}")
                 
-                response = {'type': 'push_file_ack'}
-                client_socket.send(json.dumps(response).encode('utf-8'))
+                # Send acknowledgment
+                ack_response = {'type': 'push_file_ack'}
+                response_data = json.dumps(ack_response).encode('utf-8')
+                client_socket.send(len(response_data).to_bytes(4, 'big'))
+                client_socket.send(response_data)
                     
         except Exception as e:
             print(f"Error handling client {address}: {e}")
@@ -182,7 +215,7 @@ class TransceiverService:
             client_socket.close()
 
     def download_file_from_peer(self, peer_ip, peer_port, file_path):
-        """Download a specific file from a peer."""
+        """Download a specific file from a peer using binary protocol."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((peer_ip, peer_port))
@@ -193,28 +226,40 @@ class TransceiverService:
             }
             sock.send(json.dumps(request).encode('utf-8'))
             
-            # Receive file data (may need to handle large files better)
-            response_data = b""
-            while True:
-                chunk = sock.recv(8192)
-                if not chunk:
-                    break
-                response_data += chunk
+            # Receive header length
+            header_length_data = sock.recv(4)
+            if len(header_length_data) != 4:
+                sock.close()
+                return
+            header_length = int.from_bytes(header_length_data, 'big')
             
-            response = json.loads(response_data.decode('utf-8'))
-            sock.close()
+            # Receive header
+            header_data = sock.recv(header_length).decode('utf-8')
+            header = json.loads(header_data)
             
-            if response['type'] == 'file_response':
-                file_data = bytes.fromhex(response['file_data'])
+            if header['type'] == 'file_response':
+                file_size = header['file_size']
                 local_file_path = self.sync_folder / file_path
                 
                 # Create directories if needed
                 local_file_path.parent.mkdir(parents=True, exist_ok=True)
                 
+                # Receive file data in chunks
                 with open(local_file_path, 'wb') as f:
-                    f.write(file_data)
+                    remaining = file_size
+                    while remaining > 0:
+                        chunk_size = min(8192, remaining)
+                        chunk = sock.recv(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
                 
                 print(f"Downloaded: {file_path}")
+            elif header['type'] == 'file_not_found':
+                print(f"File not found on peer: {file_path}")
+            
+            sock.close()
                 
         except Exception as e:
             print(f"Error downloading file {file_path} from {peer_ip}:{peer_port}: {e}")
@@ -249,8 +294,15 @@ class TransceiverService:
             }
             sock.send(json.dumps(request).encode('utf-8'))
             
-            # Receive list of files the peer wants
-            response_data = sock.recv(8192).decode('utf-8')
+            # Receive header length
+            header_length_data = sock.recv(4)
+            if len(header_length_data) != 4:
+                sock.close()
+                return
+            header_length = int.from_bytes(header_length_data, 'big')
+            
+            # Receive response
+            response_data = sock.recv(header_length).decode('utf-8')
             response = json.loads(response_data)
             sock.close()
             
@@ -271,7 +323,7 @@ class TransceiverService:
             print(f"Error pushing to peer {peer_ip}:{peer_port}: {e}")
 
     def send_file_to_peer(self, peer_ip, peer_port, file_path):
-        """Send a specific file to a peer."""
+        """Send a specific file to a peer using binary protocol."""
         try:
             local_file_path = self.sync_folder / file_path
             
@@ -279,25 +331,36 @@ class TransceiverService:
                 print(f"  Warning: File {file_path} no longer exists locally")
                 return
             
-            with open(local_file_path, 'rb') as f:
-                file_data = f.read()
+            file_size = local_file_path.stat().st_size
             
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((peer_ip, peer_port))
             
+            # Send file info header
             request = {
                 'type': 'push_file',
                 'file_path': file_path,
-                'file_data': file_data.hex()
+                'file_size': file_size
             }
             sock.send(json.dumps(request).encode('utf-8'))
             
-            # Wait for acknowledgment
-            response_data = sock.recv(1024).decode('utf-8')
-            response = json.loads(response_data)
+            # Send file data in chunks
+            with open(local_file_path, 'rb') as f:
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        break
+                    sock.send(chunk)
             
-            if response['type'] == 'push_file_ack':
-                print(f"  Sent: {file_path}")
+            # Wait for acknowledgment
+            header_length_data = sock.recv(4)
+            if len(header_length_data) == 4:
+                header_length = int.from_bytes(header_length_data, 'big')
+                response_data = sock.recv(header_length).decode('utf-8')
+                response = json.loads(response_data)
+                
+                if response['type'] == 'push_file_ack':
+                    print(f"  Sent: {file_path}")
             
             sock.close()
             
@@ -314,7 +377,15 @@ class TransceiverService:
             request = {'type': 'manifest_request'}
             sock.send(json.dumps(request).encode('utf-8'))
             
-            response_data = sock.recv(8192).decode('utf-8')
+            # Receive header length
+            header_length_data = sock.recv(4)
+            if len(header_length_data) != 4:
+                sock.close()
+                return
+            header_length = int.from_bytes(header_length_data, 'big')
+            
+            # Receive manifest response
+            response_data = sock.recv(header_length).decode('utf-8')
             response = json.loads(response_data)
             sock.close()
             
