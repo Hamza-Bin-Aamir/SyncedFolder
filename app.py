@@ -371,6 +371,21 @@ class TransceiverListener:
         if name in self.transceiver_service.peers:
             del self.transceiver_service.peers[name]
 
+    def update_service(self, zeroconf, type_, name):
+        """Called when service information is updated."""
+        # For now, we'll treat updates the same as adding a service
+        # In case the IP or port changed
+        if name == self.own_service_name:
+            return
+        info = zeroconf.get_service_info(type_, name)
+        if info:
+            ip = socket.inet_ntoa(info.addresses[0])
+            port = info.port
+            print(f"Transceiver updated: {name} at {ip}:{port}")
+            
+            # Update peer information
+            self.transceiver_service.peers[name] = (ip, port)
+
 
 def handle_user_input(service):
     """Handle user input for push commands."""
